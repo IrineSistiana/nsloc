@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/exp/slices"
 	"golang.org/x/time/rate"
 
 	dnsClient "github.com/IrineSistiana/nsloc/pkg/dns_client"
@@ -21,7 +22,6 @@ import (
 	geoip2 "github.com/oschwald/geoip2-golang"
 	"github.com/schollz/progressbar/v3"
 	"go.uber.org/zap"
-	"golang.org/x/exp/slices"
 )
 
 func runScan(ctx context.Context, a args) error {
@@ -149,27 +149,11 @@ func runScan(ctx context.Context, a args) error {
 
 type Result struct {
 	Fqdn      string   `json:"fqdn,omitempty"`
-	Ns        string   `json:"ns,omitempty"`
-	LocCode   []string `json:"loc,omitempty"`
 	ElapsedMs int64    `json:"elapsed_ms,omitempty"`
-
-	m      sync.Mutex
-	NsAddr []string `json:"ns_addr,omitempty"`
-	Errs   []string `json:"errs,omitempty"`
-}
-
-func (r *Result) appendNsAddr(ip []netip.Addr) {
-	r.m.Lock()
-	defer r.m.Unlock()
-	addrsStr := ip2str(ip)
-	slices.Sort(addrsStr)
-	r.NsAddr = append(r.NsAddr, addrsStr...)
-}
-
-func (r *Result) appendErr(err error) {
-	r.m.Lock()
-	defer r.m.Unlock()
-	r.Errs = append(r.Errs, err.Error())
+	Nss       []string `json:"nss,omitempty"`
+	NsAddrs   []string `json:"ns_addrs,omitempty"`
+	LocCodes  []string `json:"locs,omitempty"`
+	Errs      []string `json:"errs,omitempty"`
 }
 
 type scanner struct {
@@ -187,63 +171,84 @@ func (s *scanner) scan(ctx context.Context, fqdn string) (r *Result) {
 		r.ElapsedMs = time.Since(start).Milliseconds()
 	}()
 
-	ns, err := s.queryMainNs(ctx, fqdn)
+	nss, err := s.queryNs(ctx, fqdn)
 	if err != nil {
-		r.Errs = append(r.Errs, fmt.Sprintf("failed to lookup main ns, %s", err))
+		r.Errs = append(r.Errs, fmt.Sprintf("failed to lookup ns, %s", err))
 		return
 	}
-	if len(ns) == 0 {
-		r.Errs = append(r.Errs, "no soa record")
+	if len(nss) == 0 {
+		r.Errs = append(r.Errs, "no ns record")
 		return
 	}
-	r.Ns = ns
+	r.Nss = nss
 
-	geoCcM := new(sync.Mutex)
-	geoCc := make(map[string]struct{})
+	errL := new(sync.Mutex)
+	errs := make([]error, 0)
+	addrsL := new(sync.Mutex)
+	addrsM := make(map[netip.Addr]struct{})
+
+	appendErr := func(err error) {
+		errL.Lock()
+		defer errL.Unlock()
+		errs = append(errs, err)
+	}
+	appendNsAddr := func(s []netip.Addr) {
+		addrsL.Lock()
+		defer addrsL.Unlock()
+		for _, a := range s {
+			addrsM[a] = struct{}{}
+		}
+	}
+
 	wg := new(sync.WaitGroup)
+	for i, ns := range nss {
+		if i > 3 { // Lookup at most 3 name servers. Should be enough.
+			break
+		}
+		ns := ns
+		for _, qt := range [...]uint16{dns.TypeA, dns.TypeAAAA} {
+			qt := qt
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
 
-	for _, qt := range [...]uint16{dns.TypeA, dns.TypeAAAA} {
-		qt := qt
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			nsAddrs, err := s.queryAddr(ctx, ns, qt)
-			if err != nil {
-				r.appendErr(fmt.Errorf("failed to lookup ns addr qt=%d, %w", qt, err))
-			}
-			if len(nsAddrs) > 0 {
-				r.appendNsAddr(nsAddrs)
-				for _, ip := range nsAddrs {
-					c, err := s.geoReader.Country(ip.AsSlice())
-					if err != nil {
-						logger.Error("geoip database read err", zap.Error(err))
-						continue
-					}
-					if s := c.Country.IsoCode; len(s) > 0 {
-						geoCcM.Lock()
-						geoCc[s] = struct{}{}
-						geoCcM.Unlock()
-					}
+				nsAddrs, err := s.queryAddr(ctx, ns, qt)
+				if err != nil {
+					appendErr(fmt.Errorf("failed to lookup ns %s addr qt=%d, %w", ns, qt, err))
 				}
-			}
-		}()
+				if len(nsAddrs) > 0 {
+					appendNsAddr(nsAddrs)
+				}
+			}()
+		}
 	}
 	wg.Wait()
 
-	for cc := range geoCc {
-		r.LocCode = append(r.LocCode, cc)
-		slices.Sort(r.LocCode)
-	}
-	return
-}
+	locCodesM := make(map[string]struct{})
+	for addr := range addrsM {
+		r.NsAddrs = append(r.NsAddrs, addr.String())
 
-func ip2str(ips []netip.Addr) []string {
-	var r []string
-	for _, ip := range ips {
-		r = append(r, ip.String())
+		c, err := s.geoReader.Country(addr.AsSlice())
+		if err != nil {
+			logger.Error("geoip database read err", zap.Error(err)) // Fatal error maybe?
+			continue
+		}
+		if s := c.Country.IsoCode; len(s) > 0 {
+			locCodesM[s] = struct{}{}
+		}
 	}
-	return r
+	r.LocCodes = key(locCodesM)
+
+	for _, err := range errs {
+		r.Errs = append(r.Errs, err.Error())
+	}
+
+	// Just make result looks better.
+	slices.Sort(r.Nss)
+	slices.Sort(r.NsAddrs)
+	slices.Sort(r.LocCodes)
+	slices.Sort(r.Errs)
+	return
 }
 
 type grPool struct {
@@ -274,23 +279,24 @@ func (s *scanner) query(ctx context.Context, fqdn string, qt uint16) (*dns.Msg, 
 	return s.dnsClient.Query(ctx, q, s.upstreamAddrs[rand.Intn(len(s.upstreamAddrs))])
 }
 
-func (s *scanner) queryMainNs(ctx context.Context, fqdn string) (string, error) {
-	resp, err := s.query(ctx, fqdn, dns.TypeSOA)
+func (s *scanner) queryNs(ctx context.Context, fqdn string) ([]string, error) {
+	resp, err := s.query(ctx, fqdn, dns.TypeNS)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if resp.Rcode != dns.RcodeSuccess {
-		return "", fmt.Errorf("bad rcode %d", resp.Rcode)
+		return nil, fmt.Errorf("bad rcode %d", resp.Rcode)
 	}
 
-	// find soa
+	// find ns records
+	var nss []string
 	for _, rr := range resp.Answer {
-		if soa, ok := rr.(*dns.SOA); ok {
-			return soa.Ns, nil
+		if ns, ok := rr.(*dns.NS); ok {
+			nss = append(nss, ns.Ns)
 		}
 	}
-	return "", nil
+	return nss, nil
 }
 
 func (s *scanner) queryAddr(ctx context.Context, fqdn string, qt uint16) ([]netip.Addr, error) {
@@ -324,4 +330,15 @@ func (s *scanner) queryAddr(ctx context.Context, fqdn string, qt uint16) ([]neti
 		}
 	}
 	return addrs, nil
+}
+
+func key[K comparable, V any](m map[K]V) []K {
+	if len(m) == 0 {
+		return nil
+	}
+	s := make([]K, 0, len(m))
+	for k := range m {
+		s = append(s, k)
+	}
+	return s
 }
